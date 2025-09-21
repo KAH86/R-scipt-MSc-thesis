@@ -1,0 +1,304 @@
+#!/usr/bin/env Rscript
+
+# make_boxplots.R
+# ---------------
+# R version of make_boxplots.py
+# Create four grouped box plots (per mapping session × group) for:
+#   1) Total polygons
+#   2) Main types (total)  
+#   3) Mapping units (total)
+#   4) % Terrestrial area
+#
+# Data assumptions:
+# - Excel sheet like "Tabeller til Box Plot (2).xlsx" (sheet "Ark1")
+# - Columns: "Gruppe", "Kartlegger", and the four metrics:
+#     "Antall Polygoner (totalt)"
+#     "Antall Hovedtyper (totalt)" 
+#     "Antall Kartleggingsenheter (totalt)"
+#     "% Terrestrisk Areal"
+# - First column contains mapping-session labels at group breaks, e.g. "Dag 1 / Kart 2", etc.
+#   We forward-fill this into a new column "Session".
+#
+# Usage examples:
+#   Rscript make_boxplots.R --excel "Tabeller til Box Plot (2).xlsx" --sheet Ark1 --outdir ./plots
+#   Rscript make_boxplots.R --excel data.xlsx --sheet Ark1 --outdir ./plots --lang no \
+#       --y-step-polygons 5 --y-lines-polygons 30,40,50 \
+#       --y-lines-main-types 4,5,6,7 --y-lines-mapping-units 8,12,16,20 \
+#       --y-lines-terrestrial 45,50,55 --point-jitter
+#
+# Required packages:
+#   install.packages(c("readxl", "ggplot2", "dplyr", "argparser", "gridExtra", "scales"))
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(ggplot2) 
+  library(dplyr)
+  library(argparser)
+  library(gridExtra)
+  library(scales)
+})
+
+SESSION_ORDER <- c("Dag 1 / Kart 2", "Dag 2 / Kart 4", "Dag 3 / Kart 1", "Dag 4 / Kart 3")
+
+# Column names in the input sheet
+COL_GROUP <- "Gruppe"
+COL_MAPPER <- "Kartlegger"
+COL_POLYGONS <- "Antall Polygoner (totalt)"
+COL_MAIN_TYPES <- "Antall Hovedtyper (totalt)"
+COL_MAPPING_UNITS <- "Antall Kartleggingsenheter (totalt)"
+COL_PCT_TERR <- "% Terrestrisk Areal"
+
+load_and_prepare <- function(path_xlsx, sheet) {
+  df <- read_excel(path_xlsx, sheet = sheet)
+  
+  # Forward-fill session labels from the first column
+  session_col <- names(df)[1]
+  df$Session <- na.locf(ifelse(is.na(df[[session_col]]), NA, df[[session_col]]), na.rm = FALSE)
+  df$Session[is.na(df$Session)] <- SESSION_ORDER[1]
+  
+  # Drop embedded header rows
+  mask_header <- trimws(as.character(df[[COL_MAPPER]])) == COL_MAPPER
+  df <- df[!mask_header & !is.na(df[[COL_MAPPER]]), ]
+  
+  # Cast numerics for the four metrics
+  for (col in c(COL_POLYGONS, COL_MAIN_TYPES, COL_MAPPING_UNITS, COL_PCT_TERR)) {
+    df[[col]] <- as.numeric(df[[col]])
+  }
+  
+  # Ensure ordered factor for Session
+  df$Session <- factor(df$Session, levels = SESSION_ORDER, ordered = TRUE)
+  
+  return(df)
+}
+
+tidy_for_plotting <- function(df, lang) {
+  # Language mapping
+  if (tolower(substr(lang, 1, 2)) == "no") {
+    group_map <- c("Gruppe 1" = "Gruppe 1", "Gruppe 2" = "Gruppe 2", "CTRL" = "Kontroll")
+    mapping_label <- "Kartlegging"
+    labels <- list(
+      "Total polygons" = "Antall polygoner (totalt)",
+      "Main types (total)" = "Antall hovedtyper (totalt)",
+      "Mapping units (total)" = "Antall kartleggingsenheter (totalt)",
+      "% Terrestrial area" = "% terrestrisk areal"
+    )
+  } else {
+    group_map <- c("Gruppe 1" = "Group 1", "Gruppe 2" = "Group 2", "CTRL" = "Control")
+    mapping_label <- "Mapping"
+    labels <- list(
+      "Total polygons" = "Total polygons",
+      "Main types (total)" = "Main types (total)",
+      "Mapping units (total)" = "Mapping units (total)",
+      "% Terrestrial area" = "% Terrestrial area"
+    )
+  }
+  
+  sess_index <- setNames(1:length(SESSION_ORDER), SESSION_ORDER)
+  
+  out <- data.frame(
+    Mapping = sess_index[as.character(df$Session)],
+    Session = df$Session,
+    Group = group_map[df[[COL_GROUP]]],
+    `Total polygons` = df[[COL_POLYGONS]],
+    `Main types (total)` = df[[COL_MAIN_TYPES]],
+    `Mapping units (total)` = df[[COL_MAPPING_UNITS]],
+    `% Terrestrial area` = df[[COL_PCT_TERR]],
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  )
+  
+  attr(out, "labels") <- labels
+  attr(out, "mapping_label") <- mapping_label
+  
+  return(out)
+}
+
+grouped_boxplot <- function(data, metric, y_label, mapping_label, 
+                          y_tick_step = NULL, hlines = NULL, point_jitter = FALSE) {
+  
+  sessions <- sort(unique(data$Mapping))
+  groups <- if ("Group 1" %in% unique(data$Group)) {
+    c("Group 1", "Group 2", "Control")
+  } else {
+    c("Gruppe 1", "Gruppe 2", "Kontroll")
+  }
+  
+  # Colors specified by stakeholder
+  colors <- c("#3998a7", "#83eecb", "#F4A261")  # Blue, Green, Orange
+  names(colors) <- groups
+  
+  # Prepare data for ggplot
+  plot_data <- data %>%
+    select(Mapping, Group, !!metric) %>%
+    filter(!is.na(.data[[metric]])) %>%
+    mutate(
+      Group = factor(Group, levels = groups),
+      MappingGroup = paste(Mapping, Group, sep = "_")
+    )
+  
+  # Calculate positions for grouped boxplots
+  width <- 0.22
+  plot_data$x_pos <- plot_data$Mapping + (as.numeric(plot_data$Group) - 2) * width
+  
+  p <- ggplot(plot_data, aes(x = x_pos, y = .data[[metric]])) +
+    geom_boxplot(aes(group = MappingGroup, fill = Group), 
+                 width = width * 0.9, alpha = 0.7) +
+    scale_fill_manual(values = colors) +
+    scale_x_continuous(
+      breaks = sessions,
+      labels = as.character(sessions),
+      limits = c(0.5, length(sessions) + 0.5)
+    ) +
+    labs(x = mapping_label, y = y_label) +
+    theme_minimal() +
+    theme(
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor = element_blank(),
+      legend.title = element_text(size = 10)
+    )
+  
+  # Add vertical separators between sessions
+  for (j in 1:(length(sessions) - 1)) {
+    p <- p + geom_vline(xintercept = j + 0.5, linetype = "dotted", alpha = 0.7)
+  }
+  
+  # Add horizontal reference lines
+  if (!is.null(hlines)) {
+    for (y in hlines) {
+      p <- p + geom_hline(yintercept = y, linetype = "solid", alpha = 0.4)
+    }
+  }
+  
+  # Add jittered points if requested
+  if (isTRUE(point_jitter)) {
+    jitter_data <- plot_data %>%
+      group_by(MappingGroup) %>%
+      mutate(
+        jitter = runif(n(), -width * 0.3, width * 0.3),
+        x_jitter = x_pos + jitter
+      )
+    
+    p <- p + geom_point(data = jitter_data, 
+                        aes(x = x_jitter, fill = Group),
+                        size = 2, alpha = 0.7, shape = 21, stroke = 0.5)
+  }
+  
+  # Set y-axis formatting
+  if (!is.null(y_tick_step)) {
+    p <- p + scale_y_continuous(breaks = function(x) seq(floor(min(x)), ceiling(max(x)), by = y_tick_step),
+                                labels = function(x) sprintf("%.0f", x))
+  } else {
+    p <- p + scale_y_continuous(labels = function(x) sprintf("%.0f", x))
+  }
+  
+  # Update legend title based on language
+  legend_title <- if (groups[1] == "Group 1") "Group" else "Gruppe"
+  p <- p + labs(fill = legend_title)
+  
+  return(p)
+}
+
+save_plot <- function(plot, outdir, basename, dpi = 200) {
+  if (!dir.exists(outdir)) {
+    dir.create(outdir, recursive = TRUE)
+  }
+  
+  path <- file.path(outdir, basename)
+  ggsave(path, plot, dpi = dpi, width = 10, height = 6, units = "in")
+  cat(sprintf("Saved: %s\n", path))
+  return(path)
+}
+
+main <- function() {
+  # Parse command line arguments
+  p <- arg_parser("Create grouped box plots for NiN harmonization study.")
+  p <- add_argument(p, "--excel", help = "Path to Excel file (e.g., 'Tabeller til Box Plot (2).xlsx')")
+  p <- add_argument(p, "--sheet", default = "Ark1", help = "Sheet name (default: Ark1)")
+  p <- add_argument(p, "--outdir", default = "./plots", help = "Output directory for PNGs")
+  p <- add_argument(p, "--lang", default = "en", help = "Axis/legend language (en/no)")
+  p <- add_argument(p, "--dpi", type = "numeric", default = 200, help = "Figure DPI")
+  p <- add_argument(p, "--point-jitter", flag = TRUE, help = "Overlay raw points with jitter")
+  
+  # Per-metric y tick step and horizontal reference lines
+  p <- add_argument(p, "--y-step-polygons", type = "numeric", help = "Y-axis step for polygons")
+  p <- add_argument(p, "--y-lines-polygons", help = "Horizontal lines for polygons (comma-separated)")
+  
+  p <- add_argument(p, "--y-step-main-types", type = "numeric", help = "Y-axis step for main types")
+  p <- add_argument(p, "--y-lines-main-types", help = "Horizontal lines for main types (comma-separated)")
+  
+  p <- add_argument(p, "--y-step-mapping-units", type = "numeric", help = "Y-axis step for mapping units")
+  p <- add_argument(p, "--y-lines-mapping-units", help = "Horizontal lines for mapping units (comma-separated)")
+  
+  p <- add_argument(p, "--y-step-terrestrial", type = "numeric", help = "Y-axis step for terrestrial")
+  p <- add_argument(p, "--y-lines-terrestrial", help = "Horizontal lines for terrestrial (comma-separated)")
+  
+  args <- parse_args(p)
+  
+  if (is.na(args$excel)) {
+    stop("--excel argument is required")
+  }
+  
+  # Parse comma-separated horizontal lines
+  parse_lines <- function(lines_str) {
+    if (is.null(lines_str) || is.na(lines_str) || lines_str == "") return(NULL)
+    as.numeric(unlist(strsplit(lines_str, ",")))
+  }
+  
+  lines_polygons <- parse_lines(args$`y-lines-polygons`)
+  lines_main_types <- parse_lines(args$`y-lines-main-types`)
+  lines_mapping_units <- parse_lines(args$`y-lines-mapping-units`)
+  lines_terrestrial <- parse_lines(args$`y-lines-terrestrial`)
+  
+  # Load and prepare data
+  df <- load_and_prepare(args$excel, args$sheet)
+  tidy <- tidy_for_plotting(df, args$lang)
+  labels <- attr(tidy, "labels")
+  mapping_label <- attr(tidy, "mapping_label")
+  
+  # Define metrics to plot
+  metrics <- list(
+    list(metric = "Total polygons", short = "polygons", 
+         step = args$`y-step-polygons`, lines = lines_polygons),
+    list(metric = "Main types (total)", short = "main_types", 
+         step = args$`y-step-main-types`, lines = lines_main_types),
+    list(metric = "Mapping units (total)", short = "mapping_units", 
+         step = args$`y-step-mapping-units`, lines = lines_mapping_units),
+    list(metric = "% Terrestrial area", short = "terrestrial", 
+         step = args$`y-step-terrestrial`, lines = lines_terrestrial)
+  )
+  
+  # Create plots
+  for (m in metrics) {
+    plot <- grouped_boxplot(
+      tidy,
+      metric = m$metric,
+      y_label = labels[[m$metric]],
+      mapping_label = mapping_label,
+      y_tick_step = m$step,
+      hlines = m$lines,
+      point_jitter = isTRUE(args$`point-jitter`)
+    )
+    
+    fname <- paste0("boxplot_", m$short, ".png")
+    save_plot(plot, args$outdir, fname, dpi = args$dpi)
+  }
+  
+  # Save the tidy dataset for reproducibility
+  tidy_path <- file.path(args$outdir, "plotting_tidy_dataset.csv")
+  if (!dir.exists(args$outdir)) {
+    dir.create(args$outdir, recursive = TRUE)
+  }
+  write.csv(tidy, tidy_path, row.names = FALSE)
+  cat(sprintf("Saved: %s\n", tidy_path))
+}
+
+# Load required library for forward fill
+if (!require("zoo", quietly = TRUE)) {
+  install.packages("zoo")
+  library(zoo)
+}
+
+# Check if script is being run directly
+if (!interactive()) {
+  main()
+}
